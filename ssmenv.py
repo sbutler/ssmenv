@@ -49,12 +49,6 @@ PARAMETER_NAME_RE = re.compile(r'/(?P<name>[a-zA-Z_][a-zA-Z_0-9]*)$')
 def parseArguments():
     parser = argparse.ArgumentParser(description='Walk the path of an SSM Parameter Store and build an environment file from the results.')
     parser.add_argument(
-        '--export', '-e',
-        action='store_true',
-        default=os.environ.get('EXPORT', 'False').lower() in ('true', 't', 'yes', 'y', '1'),
-        help='add an "export" argument before each variable',
-    )
-    parser.add_argument(
         '--output', '-o',
         action='store',
         metavar='FILE',
@@ -66,6 +60,13 @@ def parseArguments():
         action='store_true',
         default=os.environ.get('RECURSIVE', 'False').lower() in ('true', 't', 'yes', 'y', '1'),
         help='recursively walk the parameter store path',
+    )
+    parser.add_argument(
+        '--style', '-s',
+        action='store',
+        choices=['bash','dotenv','docker'],
+        default=os.environ.get('STYLE', 'dotenv'),
+        help='what style to output. dotenv and bash both quote for the shell but bash adds "export", and docker is a plain output',
     )
     parser.add_argument(
         '--verbose', '-v',
@@ -85,7 +86,7 @@ def parseArguments():
 
     return parser.parse_args()
 
-def processParameters(path, fh, recursive=False, export=False):
+def processParameters(path, fh, recursive=False, style='dotenv'):
     """
     Take a path in SSM Parameter Store, get all of its keys and values, and
     write them to the output file handle as shell variables.
@@ -122,7 +123,10 @@ def processParameters(path, fh, recursive=False, export=False):
                 logger.warning('%(Name)s: skipping parameter because of invalid bash name', param)
                 continue
             name = m.group('name')
-            value = shlex.quote(param['Value'])
+            if style in ('bash', 'dotenv'):
+                value = shlex.quote(param['Value'])
+            else:
+                value = param['Value']
 
             if param['Type'] == 'SecureString':
                 logger.debug('%(path)s: %(name)s = ********', {
@@ -136,8 +140,9 @@ def processParameters(path, fh, recursive=False, export=False):
                     'value': value
                 })
 
-            if export:
-                fh.write("export ")
+            fh.write(f"# {param['Name']}\n")
+            if style == 'bash':
+                fh.write('export ')
             fh.write(f"{name}={value}\n")
 
         nextToken = response.get('NextToken')
@@ -160,13 +165,13 @@ if __name__ == '__main__':
     elif args.verbose == 2:
         logger.setLevel(logging.DEBUG)
 
-    logger.debug('Arg: export = %(value)r', { 'value': args.export })
     logger.debug('Arg: output = %(value)r', { 'value': args.output })
     logger.debug('Arg: recursive = %(value)r', { 'value': args.recursive })
+    logger.debug('Arg: style = %(value)r', { 'value': args.style })
 
     with open(args.output, 'w') as fh:
         for path in args.parameters:
             try:
-                processParameters(path, fh, recursive=args.recursive, export=args.export)
+                processParameters(path, fh, recursive=args.recursive, style=args.style)
             except Exception as ex:
                 logger.exception(ex, 'Unable to process parameters for %(path)r', { 'path': path })
