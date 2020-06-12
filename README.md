@@ -105,6 +105,14 @@ that starts with `PARAMETER` (example: `PARAMETER`, `PARAMETER_common`,
 `PARAMETER_app`, etc). If you use the command line then the paths are all the
 renaming, non-named arguments to the command.
 
+AWS Permissions
+---------------
+
+This script uses `ssm:GetParametersByPath`. Additionally, if you have parameters
+protected by an AWS KMS CMK then you will need to add permissions to use that
+key to decrypt. AWS says `kms:Decrypt` is sufficient but you might need to add
+more permissions.
+
 Usage
 -----
 
