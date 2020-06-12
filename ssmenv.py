@@ -96,8 +96,8 @@ def processParameters(path, fh, recursive=False, style='dotenv'):
         fh: An open, writeable file handle to output the shell key=value.
         recursive (optional): Whether to walk the ``path`` recursively or not.
             The default is to not recurse.
-        export (optional): Whether to add the "export" term before each variable.
-            The default is to not add that term.
+        style (optional): What style of envvars to output (bash, dotenv, docker).
+            The default is to use dotenv.
     """
     if not path:
         raise ValueError('the path is not specified')
