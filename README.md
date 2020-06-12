@@ -103,7 +103,7 @@ You can specify one or more SSM Parameter Store paths to get names and values
 from. If you use the environment variables you can specify paths in any variable
 that starts with `PARAMETER` (example: `PARAMETER`, `PARAMETER_common`,
 `PARAMETER_app`, etc). If you use the command line then the paths are all the
-renaming, non-named arguments to the command.
+remaining, non-named arguments to the command.
 
 AWS Permissions
 ---------------
