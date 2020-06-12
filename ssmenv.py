@@ -174,4 +174,4 @@ if __name__ == '__main__':
             try:
                 processParameters(path, fh, recursive=args.recursive, style=args.style)
             except Exception as ex:
-                logger.exception(ex, 'Unable to process parameters for %(path)r', { 'path': path })
+                logger.exception('Unable to process parameters for %(path)r', { 'path': path })
