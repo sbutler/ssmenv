@@ -43,10 +43,15 @@ import re
 import shlex
 from uuid import uuid4
 
+import azure.identity
+import azure.keyvault.secrets
 import boto3
 from jproperties import Properties
 
 logger = logging.getLogger(__name__)
+
+azureCredentials = azure.identity.DefaultAzureCredential()
+
 awsSSM = boto3.client('ssm')
 
 ENV_STYLES = {'bash', 'dotenv', 'docker'}
@@ -64,6 +69,13 @@ FH_BINARY_STYLES = {'java'}
 
 def parseArguments():
     parser = argparse.ArgumentParser(description='Walk the path of an SSM Parameter Store and build an environment file from the results.')
+    parser.add_argument(
+        '--cloud', '-c',
+        action='store',
+        choices=['aws', 'azure'],
+        default=os.environ.get('CLOUD'),
+        help='cloud provider to query'
+    )
     parser.add_argument(
         '--output', '-o',
         action='store',
@@ -95,8 +107,8 @@ def parseArguments():
         'parameters',
         action='store',
         nargs='*',
-        metavar='ssm-path',
-        default=[os.environ[k] for k in sorted(os.environ.keys()) if k.startswith('PARAMETER')],
+        metavar='ssm-path|key-vault',
+        default=[os.environ[k] for k in sorted(os.environ.keys()) if k.startswith('PARAMETER') or k.startswith('KEYVAULT')],
         help='parameter paths to walk',
     )
 
@@ -190,6 +202,52 @@ def generateAWSParameters(paths, recursive=False):
                 if not nextToken:
                     logger.info('Finished iterating parameters for %(path)r', { 'path': path })
                     break
+
+def generateAzureParameters(names, recursive=False):
+    """
+    Take Key Vault URLs, get all of their secrets and value, and
+    yield them to the calling function.
+
+    This does not throw the errors returned by ``SecretsClient``.
+    Instead they are logged and iteration stops.
+
+    Args:
+        names (List[str]): The Key Vault names to walk.
+    """
+    for vaultName in names:
+        client = azure.keyvault.secrets.SecretClient(
+            f"https://{vaultName}.vault.azure.net",
+            azureCredentials
+        )
+
+        try:
+            secretsProps = client.list_properties_of_secrets()
+        except Exception:
+            logger.exception('Unable to list properties of secrets for %(vault)r', { 'vault': vaultName })
+            continue
+
+        for secretProps in secretsProps:
+            if not secretProps.enabled:
+                logger.info('Secret is disabled %(vault)s/%(name)s', {
+                    'vault': vaultName,
+                    'name': secretProps.name,
+                })
+                continue
+
+            try:
+                secret = client.get_secret(secretProps.name)
+            except Exception:
+                logger.exception('Unable to get secret value %(vault)s/%(name)s', {
+                    'vault': vaultName,
+                    'name': secretProps.name,
+                })
+                continue
+            else:
+                yield {
+                    'Name': f"/{vaultName}/{secret.name}",
+                    'Type': 'SecureString',
+                    'Value': secret.value,
+                }, f"/{vaultName}"
 
 def processDirParameters(params, outputDir):
     """
@@ -361,7 +419,12 @@ if __name__ == '__main__':
     logger.debug('Arg: recursive = %(value)r', { 'value': args.recursive })
     logger.debug('Arg: style = %(value)r', { 'value': args.style })
 
-    params = generateAWSParameters(args.parameters, recursive=args.recursive)
+    if args.cloud == 'aws':
+        params = generateAWSParameters(args.parameters, recursive=args.recursive)
+    elif args.cloud == 'azure':
+        params = generateAzureParameters(args.parameters)
+    else:
+        raise ValueError('cloud')
 
     if args.style in DIR_STYLES:
         processDirParameters(params, args.output)
