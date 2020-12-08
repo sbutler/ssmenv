@@ -38,8 +38,10 @@ import argparse
 from configparser import ConfigParser
 import logging
 import os
+from os import path
 import re
 import shlex
+from uuid import uuid4
 
 import boto3
 from jproperties import Properties
@@ -51,10 +53,12 @@ ENV_STYLES = {'bash', 'dotenv', 'docker'}
 ENV_PARAMETER_NAME_RE = re.compile(r'/(?P<name>[a-zA-Z_][a-zA-Z_0-9]*)$')
 
 INI_STYLES = {'ini'}
-INI_PARAMETER_NAME_RE = re.compile(r'/(?:(?P<section>[a-zA-Z0-9_-]+)[.])?(?P<name>[a-zA-Z0-9_-]+)$')
+INI_PARAMETER_NAME_RE = re.compile(r'^/(?:(?P<section>[a-zA-Z0-9_-]+)[./])?(?P<name>[a-zA-Z0-9_-]+)$')
 
 JAVA_STYLES = {'java'}
-JAVA_PARAMETER_NAME_RE = re.compile(r'/(?P<name>.+)$')
+JAVA_PARAMETER_NAME_RE = re.compile(r'^/(?P<name>.+)$')
+
+DIR_STYLES = {'file'}
 
 FH_BINARY_STYLES = {'java'}
 
@@ -63,9 +67,9 @@ def parseArguments():
     parser.add_argument(
         '--output', '-o',
         action='store',
-        metavar='FILE',
+        metavar='OUTPUT',
         default=os.environ.get('OUTPUT', '/dev/stdout'),
-        help='filename to store the environment variables in',
+        help='filename or directory to store the environment variables in',
     )
     parser.add_argument(
         '--recursive', '-r',
@@ -76,7 +80,7 @@ def parseArguments():
     parser.add_argument(
         '--style', '-s',
         action='store',
-        choices=['bash','dotenv','docker', 'ini', 'java'],
+        choices=['bash','dotenv','docker', 'ini', 'java', 'file'],
         default=os.environ.get('STYLE', 'dotenv'),
         help='what style to output. dotenv and bash both quote for the shell but bash adds "export", and docker is a plain output',
     )
@@ -98,6 +102,49 @@ def parseArguments():
 
     return parser.parse_args()
 
+def makedirs(name, mode=0o777, exist_ok=False):
+    """makedirs(name [, mode=0o777][, exist_ok=False])
+    Super-mkdir; create a leaf directory and all intermediate ones.  Works like
+    mkdir, except that any intermediate path segment (not just the rightmost)
+    will be created if it does not exist. If the target directory already
+    exists, raise an OSError if exist_ok is False. Otherwise no exception is
+    raised.  This is recursive.
+
+    Copied from python source, but also handles the case in SSM where a "dir"
+    also contains a value by renaming the dir part to ".value".
+    """
+    head, tail = path.split(name)
+    if not tail:
+        head, tail = path.split(head)
+    if head and tail and not path.isdir(head):
+        try:
+            makedirs(head, exist_ok=exist_ok)
+        except FileExistsError:
+            # Defeats race condition when another thread created the path
+            pass
+        cdir = os.curdir
+        if isinstance(tail, bytes):
+            cdir = bytes(curdir, 'ASCII')
+        if tail == cdir:           # xxx/newdir/. exists if xxx/newdir exists
+            return
+
+    try:
+        value_name = None
+        if not path.isdir(name):
+            value_name = f"{name}.{uuid4()}"
+            os.rename(name, value_name)
+
+        os.mkdir(name, mode)
+
+        if value_name:
+            os.rename(value_name, path.join(name, '.value'))
+    except OSError:
+        # Cannot rely on checking for EEXIST, since the operating system
+        # could give priority to other errors like EACCES or EROFS
+        if not exist_ok or not path.isdir(name):
+            raise
+
+
 def generateAWSParameters(paths, recursive=False):
     """
     Take a path in SSM Parameter Store, get all of its keys and values, and
@@ -116,6 +163,8 @@ def generateAWSParameters(paths, recursive=False):
             raise ValueError('the path is not specified')
         if not path.startswith('/'):
             path = '/' + path
+        if path.endswith('/'):
+            path = path[:-1]
 
         nextToken = None
         while True:
@@ -134,12 +183,52 @@ def generateAWSParameters(paths, recursive=False):
                 logger.exception('Unable to process parameters for %(path)r', { 'path': path })
                 break
             else:
-                yield from response.get('Parameters', [])
+                for param in response.get('Parameters', []):
+                    yield param, path
 
                 nextToken = response.get('NextToken')
                 if not nextToken:
                     logger.info('Finished iterating parameters for %(path)r', { 'path': path })
                     break
+
+def processDirParameters(params, outputDir):
+    """
+    Take parameters, get all of their keys and values, and write them to
+    individual output files in a base directory.
+
+    Args:
+        params (Iterator): generator for the parameters.
+        outputDir (str): path to directory for output.
+    """
+    outputDir = path.realpath(outputDir)
+    for param, basePath in params:
+        name = param['Name'][len(basePath)+1:]
+        filename = path.realpath(path.join(outputDir, name))
+        if path.commonpath([outputDir, filename]) != outputDir:
+            logger.error('%(filename)s: escaped output directory', { 'filename': filename })
+            continue
+
+        if param['Type'] == 'SecureString':
+            logger.debug('%(path)s: %(name)s = ********', {
+                'path': param['Name'],
+                'name': name
+            })
+        else:
+            logger.debug('%(path)s: %(name)s = %(value)s', {
+                'path': param['Name'],
+                'name': name,
+                'value': param['Value']
+            })
+
+        try:
+            # Check that all the dir parts exist.
+            filedir = path.dirname(filename)
+            makedirs(filedir, exist_ok=True)
+
+            with open(filename, 'wt') as fh:
+                fh.write(param['Value'])
+        except Exception:
+            logger.exception('Unable to create %(filename)s', { 'filename': filename })
 
 def processEnvParameters(params, fh, style='dotenv'):
     """
@@ -152,7 +241,7 @@ def processEnvParameters(params, fh, style='dotenv'):
         style (str): What style of envvars to output (bash, dotenv, docker).
             The default is to use dotenv.
     """
-    for param in params:
+    for param, basePath in params:
         m = ENV_PARAMETER_NAME_RE.search(param['Name'])
         if not m:
             logger.warning('%(Name)s: skipping parameter because of invalid bash name', param)
@@ -190,8 +279,9 @@ def processINIParameters(params, config):
         fh (file-like): An open, writeable file handle to output the ini values.
     """
     config = ConfigParser()
-    for param in params:
-        m = INI_PARAMETER_NAME_RE.search(param['Name'])
+    for param, basePath in params:
+        paramPath = param['Name'][len(basePath):]
+        m = INI_PARAMETER_NAME_RE.search(paramPath)
         if not m:
             logger.warning('%(Name)s: skipping parameter because of invalid ini name', param)
             continue
@@ -227,8 +317,9 @@ def processJavaParameters(params, fh):
         fh (file-like): An open, writeable file handle to output the Java properties values.
     """
     props = Properties()
-    for param in params:
-        m = JAVA_PARAMETER_NAME_RE.search(param['Name'])
+    for param, basePath in params:
+        paramPath = param['Name'][len(basePath):]
+        m = JAVA_PARAMETER_NAME_RE.search(paramPath)
         if not m:
             logger.warning('%(Name)s: skipping parameter because of invalid Java property name', param)
             continue
@@ -272,10 +363,13 @@ if __name__ == '__main__':
 
     params = generateAWSParameters(args.parameters, recursive=args.recursive)
 
-    with open(args.output, 'wb' if args.style in FH_BINARY_STYLES else 'wt') as fh:
-        if args.style in ENV_STYLES:
-            processEnvParameters(params, fh, style=args.style)
-        elif args.style in INI_STYLES:
-            processINIParameters(params, fh)
-        elif args.style in JAVA_STYLES:
-            processJavaParameters(params, fh)
+    if args.style in DIR_STYLES:
+        processDirParameters(params, args.output)
+    else:
+        with open(args.output, 'wb' if args.style in FH_BINARY_STYLES else 'wt') as fh:
+            if args.style in ENV_STYLES:
+                processEnvParameters(params, fh, style=args.style)
+            elif args.style in INI_STYLES:
+                processINIParameters(params, fh)
+            elif args.style in JAVA_STYLES:
+                processJavaParameters(params, fh)
