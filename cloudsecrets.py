@@ -35,25 +35,28 @@ WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS WITH THE SOFTWARE.
 """
 
 import argparse
-import boto3
 from configparser import ConfigParser
-from jproperties import Properties
 import logging
 import os
 import re
 import shlex
 
+import boto3
+from jproperties import Properties
+
 logger = logging.getLogger(__name__)
-ssm = boto3.client('ssm')
+awsSSM = boto3.client('ssm')
 
 ENV_STYLES = {'bash', 'dotenv', 'docker'}
 ENV_PARAMETER_NAME_RE = re.compile(r'/(?P<name>[a-zA-Z_][a-zA-Z_0-9]*)$')
 
 INI_STYLES = {'ini'}
-INI_PARAMETER_NAME_RE = re.compile(r'/(?:(?P<section>[a-zA-Z0-9_-]+)\.)(?P<name>[a-zA-Z0-9_-]+)$')
+INI_PARAMETER_NAME_RE = re.compile(r'/(?:(?P<section>[a-zA-Z0-9_-]+)[.])?(?P<name>[a-zA-Z0-9_-]+)$')
 
 JAVA_STYLES = {'java'}
 JAVA_PARAMETER_NAME_RE = re.compile(r'/(?P<name>.+)$')
+
+FH_BINARY_STYLES = {'java'}
 
 def parseArguments():
     parser = argparse.ArgumentParser(description='Walk the path of an SSM Parameter Store and build an environment file from the results.')
@@ -95,7 +98,7 @@ def parseArguments():
 
     return parser.parse_args()
 
-def generateParameters(path, recursive=False):
+def generateAWSParameters(paths, recursive=False):
     """
     Take a path in SSM Parameter Store, get all of its keys and values, and
     yield them to the calling function.
@@ -104,154 +107,149 @@ def generateParameters(path, recursive=False):
     Instead they are logged and iteration stops.
 
     Args:
-        path: The path in SSM Parameter Store to walk.
-        recursive (optional): Whether to walk the ``path`` recursively or not.
+        paths (List[str]): The path in SSM Parameter Store to walk.
+        recursive (bool): Whether to walk the ``path`` recursively or not.
             The default is to not recurse.
     """
-    if not path:
-        raise ValueError('the path is not specified')
-    if not path.startswith('/'):
-        path = '/' + path
+    for path in paths:
+        if not path:
+            raise ValueError('the path is not specified')
+        if not path.startswith('/'):
+            path = '/' + path
 
-    nextToken = None
-    while True:
-        logger.info('Getting parameters for %(path)r', { 'path': path })
+        nextToken = None
+        while True:
+            logger.info('Getting parameters for %(path)r', { 'path': path })
 
-        reqParams = dict(
-            Path=path,
-            Recursive=recursive,
-            WithDecryption=True,
-        )
-        if nextToken:
-            reqParams['NextToken'] = nextToken
-        try:
-            response = ssm.get_parameters_by_path(**reqParams)
-        except Exception:
-            logger.exception('Unable to process parameters for %(path)r', { 'path': path })
-            break
-        else:
-            yield from response.get('Parameters', [])
-
-            nextToken = response.get('NextToken')
-            if not nextToken:
-                logger.info('Finished iterating parameters')
+            reqParams = dict(
+                Path=path,
+                Recursive=recursive,
+                WithDecryption=True,
+            )
+            if nextToken:
+                reqParams['NextToken'] = nextToken
+            try:
+                response = awsSSM.get_parameters_by_path(**reqParams)
+            except Exception:
+                logger.exception('Unable to process parameters for %(path)r', { 'path': path })
                 break
+            else:
+                yield from response.get('Parameters', [])
 
-def processEnvParameters(paths, fh, recursive=False, style='dotenv'):
+                nextToken = response.get('NextToken')
+                if not nextToken:
+                    logger.info('Finished iterating parameters for %(path)r', { 'path': path })
+                    break
+
+def processEnvParameters(params, fh, style='dotenv'):
     """
-    Take paths in SSM Parameter Store, get all of their keys and values, and
-    write them to the output file handle as shell variables.
+    Take parameters, get all of their keys and values, and write them to the
+    output file handle as shell variables.
 
     Args:
-        paths: The paths in SSM Parameter Store to walk.
-        fh: An open, writeable file handle to output the shell key=value.
-        recursive (optional): Whether to walk the ``paths`` recursively or not.
-            The default is to not recurse.
-        style (optional): What style of envvars to output (bash, dotenv, docker).
+        params (Iterator): generator for the parameters.
+        fh (file-like): An open, writeable file handle to output the shell key=value.
+        style (str): What style of envvars to output (bash, dotenv, docker).
             The default is to use dotenv.
     """
-    for path in paths:
-        for param in generateParameters(path, recursive=reecursive):
-            if not m := ENV_PARAMETER_NAME_RE.search(param['Name']):
-                logger.warning('%(Name)s: skipping parameter because of invalid bash name', param)
-                continue
-            name = m.group('name')
-            if style in {'bash', 'dotenv'}:
-                value = shlex.quote(param['Value'])
-            else:
-                value = param['Value']
-
-            if param['Type'] == 'SecureString':
-                logger.debug('%(path)s: %(name)s = ********', {
-                    'path': param['Name'],
-                    'name': name
-                })
-            else:
-                logger.debug('%(path)s: %(name)s = %(value)s', {
-                    'path': param['Name'],
-                    'name': name,
-                    'value': value
-                })
-
-            fh.write(f"# {param['Name']}\n")
-            if style == 'bash':
-                fh.write('export ')
-            fh.write(f"{name}={value}\n")
-
-def processINIParameters(paths, config, recursive=False):
-    """
-    Take paths in SSM Parameter Store, get all of their keys and values, and
-    write them to the output file handle as ini values.
-
-    Args:
-        paths: The paths in SSM Parameter Store to walk.
-        fh: An open, writeable file handle to output the ini values.
-        recursive (optional): Whether to walk the ``paths`` recursively or not.
-            The default is to not recurse.
-    """
-    config = ConfigParser()
-    for path in paths:
-        for param in generateParameters(path, recursive=reecursive):
-            if not m := INI_PARAMETER_NAME_RE.search(param['Name']):
-                logger.warning('%(Name)s: skipping parameter because of invalid ini name', param)
-                continue
-            section = m.group('section') if m.group('section') else 'main'
-            name = m.group('name')
+    for param in params:
+        m = ENV_PARAMETER_NAME_RE.search(param['Name'])
+        if not m:
+            logger.warning('%(Name)s: skipping parameter because of invalid bash name', param)
+            continue
+        name = m.group('name')
+        if style in {'bash', 'dotenv'}:
+            value = shlex.quote(param['Value'])
+        else:
             value = param['Value']
 
-            if param['Type'] == 'SecureString':
-                logger.debug('%(path)s: %(name)s = ********', {
-                    'path': param['Name'],
-                    'name': name
-                })
-            else:
-                logger.debug('%(path)s: %(name)s = %(value)s', {
-                    'path': param['Name'],
-                    'name': name,
-                    'value': value
-                })
+        if param['Type'] == 'SecureString':
+            logger.debug('%(path)s: %(name)s = ********', {
+                'path': param['Name'],
+                'name': name
+            })
+        else:
+            logger.debug('%(path)s: %(name)s = %(value)s', {
+                'path': param['Name'],
+                'name': name,
+                'value': value
+            })
 
-            if not section in config:
-                config[section] = {}
-            config[section][name] = value
+        fh.write(f"# {param['Name']}\n")
+        if style == 'bash':
+            fh.write('export ')
+        fh.write(f"{name}={value}\n")
+
+def processINIParameters(params, config):
+    """
+    Take parameters, get all of their keys and values, and write them to the
+    output file handle as ini values.
+
+    Args:
+        params (Iterator): generator for the parameters.
+        fh (file-like): An open, writeable file handle to output the ini values.
+    """
+    config = ConfigParser()
+    for param in params:
+        m = INI_PARAMETER_NAME_RE.search(param['Name'])
+        if not m:
+            logger.warning('%(Name)s: skipping parameter because of invalid ini name', param)
+            continue
+        section = m.group('section') if m.group('section') else 'main'
+        name = m.group('name')
+        value = param['Value']
+
+        if param['Type'] == 'SecureString':
+            logger.debug('%(path)s: %(name)s = ********', {
+                'path': param['Name'],
+                'name': name
+            })
+        else:
+            logger.debug('%(path)s: %(name)s = %(value)s', {
+                'path': param['Name'],
+                'name': name,
+                'value': value
+            })
+
+        if not section in config:
+            config[section] = {}
+        config[section][name] = value
 
     config.write(fh)
 
-def processJavaParameters(paths, fh, recursive=False):
+def processJavaParameters(params, fh):
     """
-    Take paths in SSM Parameter Store, get all of their keys and values, and
-    write them to the output file handle as Java property values.
+    Take parameters, get all of their keys and values, and write them to the
+    output file handle as Java property values.
 
     Args:
-        paths: The paths in SSM Parameter Store to walk.
-        fh: An open, writeable file handle to output the Java properties values.
-        recursive (optional): Whether to walk the ``paths`` recursively or not.
-            The default is to not recurse.
+        params (Iterator): generator for the parameters.
+        fh (file-like): An open, writeable file handle to output the Java properties values.
     """
     props = Properties()
-    for path in paths:
-        for param in generateParameters(path, recursive=reecursive):
-            if not m := JAVA_PARAMETER_NAME_RE.search(param['Name']):
-                logger.warning('%(Name)s: skipping parameter because of invalid Java property name', param)
-                continue
-            name = m.group('name')
-            value = param['Value']
+    for param in params:
+        m = JAVA_PARAMETER_NAME_RE.search(param['Name'])
+        if not m:
+            logger.warning('%(Name)s: skipping parameter because of invalid Java property name', param)
+            continue
+        name = m.group('name')
+        value = param['Value']
 
-            if param['Type'] == 'SecureString':
-                logger.debug('%(path)s: %(name)s = ********', {
-                    'path': param['Name'],
-                    'name': name
-                })
-            else:
-                logger.debug('%(path)s: %(name)s = %(value)s', {
-                    'path': param['Name'],
-                    'name': name,
-                    'value': value
-                })
+        if param['Type'] == 'SecureString':
+            logger.debug('%(path)s: %(name)s = ********', {
+                'path': param['Name'],
+                'name': name
+            })
+        else:
+            logger.debug('%(path)s: %(name)s = %(value)s', {
+                'path': param['Name'],
+                'name': name,
+                'value': value
+            })
 
-            props[name] = value
+        props[name.replace('/', '.')] = value
 
-    props.store(fh, encoding='utf-8')
+    props.store(fh, encoding="utf-8")
 
 if __name__ == '__main__':
     args = parseArguments()
@@ -272,10 +270,12 @@ if __name__ == '__main__':
     logger.debug('Arg: recursive = %(value)r', { 'value': args.recursive })
     logger.debug('Arg: style = %(value)r', { 'value': args.style })
 
-    with open(args.output, 'w') as fh:
+    params = generateAWSParameters(args.parameters, recursive=args.recursive)
+
+    with open(args.output, 'wb' if args.style in FH_BINARY_STYLES else 'wt') as fh:
         if args.style in ENV_STYLES:
-            processEnvParameters(args.parameters, fh, recursive=args.recursive, style=args.style)
+            processEnvParameters(params, fh, style=args.style)
         elif args.style in INI_STYLES:
-            processINIParameters(args.parameters, fh, recursive=args.recursive)
+            processINIParameters(params, fh)
         elif args.style in JAVA_STYLES:
-            processJavaParameters(args.parameters, fh, recursive=args.recursive)
+            processJavaParameters(params, fh)
